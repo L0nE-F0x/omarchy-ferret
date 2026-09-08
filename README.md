@@ -1,5 +1,7 @@
 # Ferret
 
+![Ferret searching for a file](preview.png)
+
 Type-to-open file search for Omarchy. Press the hotkey, start typing, press
 **Enter** — the file opens in whatever app owns it.
 
