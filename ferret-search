@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Ferret's search backend: whole-disk file lookup, ranked for humans.
+
+Two sources feed one ranked list:
+
+  plocate  indexed, whole disk, ~20ms, but only as fresh as last night's
+           updatedb run.
+  fd       live walk of $HOME, ~100ms warm, so files made since the last
+           index still show up.
+
+Merged, deduped, and scored so the thing you meant is first. Called per
+keystroke by the Ferret overlay; also usable on its own:
+
+    ferret-search "budget xlsx"        # JSON results on stdout
+    ferret-search --open <path>        # hand the path to its default app
+    ferret-search --reveal <path>      # open the containing folder
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+HOME = os.path.expanduser("~")
+
+# How many raw paths each source may return before scoring. Generous: the
+# ranker is cheap and a hard cap here is what makes a common word like
+# "config" still surface the *right* config.
+SOURCE_LIMIT = 6000
+# How many survive to the UI.
+RESULT_LIMIT = 60
+# Only the top slice gets stat()ed for recency scoring -- stat is the one
+# genuinely expensive call in here.
+STAT_LIMIT = 240
+
+# Directories that are technically matches but almost never what a person
+# typing into a launcher wants. Penalised, not excluded: search "node_modules"
+# explicitly and you will still find it.
+NOISE = (
+    ("/node_modules/", 400),
+    ("/.git/", 400),
+    ("/.cache/", 300),
+    ("/site-packages/", 300),
+    ("/__pycache__/", 400),
+    ("/.venv/", 250),
+    ("/venv/", 250),
+    ("/.local/share/Trash/", 500),
+    ("/.mozilla/", 200),
+    ("/.config/google-chrome/", 400),
+    ("/indexeddb/", 450),
+    ("/local storage/", 450),
+    ("/session storage/", 450),
+    ("/service worker/", 450),
+    ("/cache_data/", 450),
+    (".leveldb", 400),
+    ("/.steam/", 200),
+    ("/usr/lib/", 150),
+    ("/usr/share/doc/", 200),
+    ("/usr/src/", 200),
+    ("/var/lib/", 200),
+    ("/proc/", 500),
+    ("/sys/", 500),
+    ("/snap/", 250),
+    ("/.rustup/", 300),
+    ("/.cargo/registry/", 300),
+    ("/.npm/", 300),
+    ("/.gradle/", 300),
+    ("/build/", 260),
+    ("/_deps/", 400),
+    ("/cmake-build", 300),
+    ("/target/debug/", 300),
+    ("/target/release/", 300),
+    ("/dist/", 200),
+    ("/.next/", 300),
+    ("/vendor/", 200),
+    ("/.config/chromium/", 320),
+    ("/.config/Code/", 300),
+    ("/.local/share/containers/", 300),
+    ("/.bak.", 120),
+    ("/backup", 120),
+    ("/.local/state/", 150),
+    ("/google-chrome-headless/", 320),
+    ("/.grok/bundled/", 250),
+    ("/.claude/projects/", 150),
+)
+
+# Where a person actually keeps their stuff.
+PRIME = (
+    "/Documents/", "/Downloads/", "/Desktop/", "/Pictures/",
+    "/Videos/", "/Music/", "/Projects/",
+)
+
+
+def run(cmd, timeout=4.0):
+    """Run a command, return its stdout as normalised paths.
+
+    Never raises -- a dead source just means the other one carries the search.
+    Trailing slashes are stripped because fd marks directories with one and
+    plocate does not: left alone, the same directory arrives as two distinct
+    strings, survives deduplication twice, and the slashed copy renders with
+    an empty basename.
+    """
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            errors="replace",
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    paths = []
+    for line in out.stdout.splitlines():
+        line = line.rstrip("/")
+        if line:
+            paths.append(line)
+    return paths
+
+
+def locate_source(tokens):
+    """plocate with every token ANDed -- its native multi-pattern behaviour."""
+    if not shutil.which("plocate"):
+        return []
+    return run(["plocate", "-i", "--limit", str(SOURCE_LIMIT)] + tokens)
+
+
+def locate_fuzzy(tokens):
+    """Subsequence fallback: 'invc' -> i.*n.*v.*c, so abbreviations land.
+
+    Only worth spending the ~40ms when the literal search came up thin.
+    """
+    if not shutil.which("plocate"):
+        return []
+    longest = max(tokens, key=len)
+    if len(longest) < 3:
+        return []
+    pattern = ".*".join(re.escape(ch) for ch in longest)
+    return run(["plocate", "-i", "--regexp", "--limit", str(SOURCE_LIMIT), pattern])
+
+
+def fd_source(tokens):
+    """Live walk of $HOME so today's files are findable before tonight's
+    updatedb. fd takes one pattern, so filter on the longest token and let
+    the scorer handle the rest."""
+    fd = shutil.which("fd") or shutil.which("fdfind")
+    if not fd:
+        return []
+    longest = max(tokens, key=len)
+    return run([
+        fd, "--hidden", "--absolute-path", "--color", "never",
+        "--max-results", str(SOURCE_LIMIT),
+        "--ignore-case", "--fixed-strings", longest, HOME,
+    ])
+
+
+def subsequence_span(needle, haystack):
+    """Length of the tightest run covering needle as a subsequence of
+    haystack, or None. Shorter span = tighter, more deliberate match."""
+    start = -1
+    idx = 0
+    for i, ch in enumerate(haystack):
+        if idx < len(needle) and ch == needle[idx]:
+            if idx == 0:
+                start = i
+            idx += 1
+            if idx == len(needle):
+                return i - start + 1
+    return None
+
+
+def score(path, tokens, query):
+    """Rank a candidate. Positive is better; callers sort descending."""
+    lower = path.lower()
+    name = os.path.basename(path)
+    lname = name.lower()
+
+    # Every token must appear somewhere in the path, or it is not a hit.
+    if not all(tok in lower for tok in tokens):
+        # Allow a pure subsequence hit on the basename (abbreviation typing).
+        span = subsequence_span(query.replace(" ", ""), lname)
+        if span is None:
+            return None
+        points = 40 - min(30, span - len(query))
+    else:
+        points = 0
+        in_name = [tok for tok in tokens if tok in lname]
+
+        if len(tokens) == 1 and lname.endswith("." + query):
+            points += 150
+
+        if lname == query:
+            points += 260
+        elif os.path.splitext(lname)[0] == query:
+            points += 240
+        elif len(in_name) == len(tokens):
+            points += 120
+            if lname.startswith(tokens[0]):
+                points += 70
+            # Match on a word boundary reads as intentional.
+            if re.search(r"(^|[^a-z0-9])" + re.escape(tokens[0]), lname):
+                points += 30
+        elif in_name:
+            points += 60
+        else:
+            points += 15  # matched only in the directory part
+
+    # Prefer the user's own files over the system's, strongly.
+    if lower.startswith(HOME.lower() + "/"):
+        points += 90
+        if any(p.lower() in lower for p in PRIME):
+            points += 45
+    elif lower.startswith("/etc/"):
+        points += 20
+
+    for fragment, cost in NOISE:
+        if fragment.lower() in lower:
+            points -= cost
+
+    # Hidden components are usually config plumbing, not documents.
+    points -= 9 * sum(1 for part in path.split("/")[1:] if part.startswith("."))
+    # Shallow beats deep; short names beat long ones.
+    points -= 3 * path.count("/")
+    points -= 0.35 * len(name)
+    return points
+
+
+def enrich(paths, tokens, query):
+    """Score, take the best, then stat only those for recency and type."""
+    scored = []
+    for path in paths:
+        points = score(path, tokens, query)
+        if points is not None:
+            scored.append((points, path))
+    scored.sort(key=lambda item: (-item[0], len(item[1])))
+
+    results = []
+    now = time.time()
+    for points, path in scored[:STAT_LIMIT]:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue  # indexed but gone since -- silently drop
+        is_dir = os.path.isdir(path)
+        age_days = (now - st.st_mtime) / 86400
+        if age_days < 7:
+            points += 34
+        elif age_days < 30:
+            points += 18
+        elif age_days < 365:
+            points += 6
+        results.append({
+            "path": path,
+            "name": os.path.basename(path),
+            "dir": os.path.dirname(path),
+            "isDir": is_dir,
+            "ext": "" if is_dir else os.path.splitext(path)[1].lstrip(".").lower(),
+            "size": 0 if is_dir else st.st_size,
+            "mtime": int(st.st_mtime),
+            "score": round(points, 2),
+        })
+
+    results.sort(key=lambda item: -item["score"])
+    return results[:RESULT_LIMIT]
+
+
+def search(query):
+    query = " ".join(query.lower().split())
+    if len(query) < 2:
+        return []
+    tokens = query.split()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(locate_source, tokens)
+        b = pool.submit(fd_source, tokens)
+        paths = set(a.result()) | set(b.result())
+
+    results = enrich(paths, tokens, query)
+    # Thin literal result set: retry as an abbreviation before giving up.
+    if len(results) < 5:
+        paths |= set(locate_fuzzy(tokens))
+        results = enrich(paths, tokens, query)
+    return results
+
+
+def desktop_handler(path):
+    """The .desktop id the system would use for this file."""
+    try:
+        mime = subprocess.run(
+            ["xdg-mime", "query", "filetype", path],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        if not mime:
+            return ""
+        return subprocess.run(
+            ["xdg-mime", "query", "default", mime],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def launch(path):
+    """Open a path in the app that owns it.
+
+    Directories included -- xdg-mime resolves inode/directory to whatever file
+    manager is registered, so this follows the system default rather than
+    hardcoding one.
+
+    Omarchy runs apps under uwsm so each lands in its own systemd scope;
+    launching by Desktop Entry id keeps that true. The fallback chain exists
+    because the shell's PATH is narrower than a login shell's, so a wrapper
+    that resolves here may not resolve there.
+    """
+    path = os.path.abspath(path)
+    handler = desktop_handler(path)
+    cmd = [handler, path] if handler else ["xdg-open", path]
+
+    for prefix in (["setsid", "uwsm-app", "--"], ["setsid"], []):
+        try:
+            subprocess.Popen(
+                prefix + cmd,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return 0
+        except OSError:
+            continue
+    # Every wrapper failed; xdg-open directly is the last resort.
+    try:
+        subprocess.Popen(["xdg-open", path], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0
+    except OSError:
+        return 1
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print("[]")
+        return 0
+    if args[0] == "--open":
+        return launch(args[1])
+    if args[0] == "--reveal":
+        target = args[1]
+        return launch(target if os.path.isdir(target) else os.path.dirname(target))
+    print(json.dumps(search(" ".join(args))))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
