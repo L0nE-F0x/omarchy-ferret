@@ -284,15 +284,43 @@ def search(query):
     return results
 
 
-def desktop_handler(path):
-    """The .desktop id the system would use for this file."""
+def file_mime(path):
+    """The canonical mime type of a file, e.g. video/x-matroska."""
     try:
-        mime = subprocess.run(
+        return subprocess.run(
             ["xdg-mime", "query", "filetype", path],
             capture_output=True, text=True, timeout=3,
         ).stdout.strip()
-        if not mime:
-            return ""
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def desktop_handler(path):
+    """The .desktop id the system would use for this file.
+
+    Resolved through GIO rather than `xdg-mime query default`, because the
+    two disagree. A mime type can have aliases -- video/x-matroska is also
+    registered as video/matroska -- and mimeapps.list may set the default
+    under either spelling. GIO resolves the alias graph; the xdg-mime shell
+    script does a literal key match, misses a default written under the
+    alias, and falls through to the system-wide default instead. That is
+    how an .mkv set to VLC still opened in mpv.
+
+    GIO is what the file managers and portals use, so following it keeps
+    Ferret's Enter in agreement with the rest of the desktop.
+    """
+    mime = file_mime(path)
+    if not mime:
+        return ""
+    try:
+        from gi.repository import Gio
+        info = Gio.AppInfo.get_default_for_type(mime, False)
+        if info is not None:
+            return info.get_id() or ""
+    except Exception:
+        pass
+    # PyGObject missing: fall back to the alias-blind lookup.
+    try:
         return subprocess.run(
             ["xdg-mime", "query", "default", mime],
             capture_output=True, text=True, timeout=3,
