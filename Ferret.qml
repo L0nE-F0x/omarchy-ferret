@@ -27,7 +27,26 @@ Item {
   property var manifest: null
 
   readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string pluginDir: (manifest && manifest.__sourceDir) ? String(manifest.__sourceDir) : ""
+  // Where this plugin lives on disk, so the backend next to it can be run.
+  //
+  // Omarchy 4.0.3 stopped handing __sourceDir to third-party plugins: the
+  // host now sanitises the manifest through publicPluginManifest(), which
+  // deletes it. Ferret read only that field, so the helper path came out
+  // empty and every search returned before spawning anything — the overlay
+  // opened and typing did nothing.
+  //
+  // The QML file's own URL is the reliable source. Qt.resolvedUrl(".") gives
+  // a file:// URL with a trailing slash, percent-encoded; Process wants a
+  // plain path. The manifest is still consulted first, so a first-party host
+  // or an older shell that does supply __sourceDir keeps its behaviour.
+  readonly property string pluginDir: {
+    if (manifest && manifest.__sourceDir)
+      return String(manifest.__sourceDir).replace(/\/+$/, "")
+    var here = String(Qt.resolvedUrl("."))
+    if (here.indexOf("file://") === 0) here = here.substring(7)
+    try { here = decodeURIComponent(here) } catch (e) { }
+    return here.replace(/\/+$/, "")
+  }
   readonly property string helper: pluginDir ? pluginDir + "/ferret-search" : ""
 
   property bool opened: false
@@ -102,7 +121,10 @@ Item {
   }
 
   function launchSearch() {
-    if (root.helper === "") return
+    if (root.helper === "") {
+      console.warn("Ferret: cannot locate ferret-search; plugin directory unresolved")
+      return
+    }
     var wanted = root.query.trim()
     if (wanted.length < 2) return
     if (searchProc.running) {
@@ -154,6 +176,10 @@ Item {
     if (index < 0 || index >= root.results.length) return
     var entry = root.results[index]
     if (!entry || !entry.path) return
+    if (root.helper === "") {
+      console.warn("Ferret: cannot locate ferret-search; plugin directory unresolved")
+      return
+    }
     root.dismiss()
     Quickshell.execDetached([root.helper, revealFolder ? "--reveal" : "--open", String(entry.path)])
   }
