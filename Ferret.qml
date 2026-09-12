@@ -48,6 +48,22 @@ Item {
     return here.replace(/\/+$/, "")
   }
   readonly property string helper: pluginDir ? pluginDir + "/ferret-search" : ""
+  // Trusted interpreter identity. Never `env python3` and never ambient PATH.
+  readonly property string python: "/usr/bin/python3"
+
+  function backendCommand(a, b) {
+    var args = [root.python, root.helper]
+    if (a !== undefined) args.push(a)
+    if (b !== undefined) args.push(b)
+    return args
+  }
+
+  function stopSearch() {
+    debounce.stop()
+    root.restartPending = false
+    if (searchProc.running)
+      searchProc.running = false
+  }
 
   property bool opened: false
   property string query: ""
@@ -83,7 +99,7 @@ Item {
     root.results = []
     root.selectedIndex = 0
     root.searching = false
-    debounce.stop()
+    stopSearch()
     pointerGate.reset()
     Qt.callLater(function () {
       field.text = ""
@@ -93,15 +109,13 @@ Item {
 
   function close() {
     root.opened = false
-    debounce.stop()
-    // Let an in-flight search finish on its own; killing it here would race
-    // with the collector. Its reply is discarded by the query guard.
+    stopSearch()
     root.results = []
     root.query = ""
   }
 
   function dismiss() {
-    root.opened = false
+    close()
     if (root.shell && typeof root.shell.hide === "function")
       root.shell.hide((root.manifest && root.manifest.id) || "lonefox.ferret")
   }
@@ -110,9 +124,9 @@ Item {
   function setQuery(next) {
     root.query = next
     if (next.trim().length < 2) {
-      debounce.stop()
+      stopSearch()
       root.results = []
-        root.selectedIndex = 0
+      root.selectedIndex = 0
       root.searching = false
       return
     }
@@ -134,7 +148,7 @@ Item {
       return
     }
     root.inFlightQuery = wanted
-    searchProc.command = [root.helper, wanted]
+    searchProc.command = root.backendCommand("--", wanted)
     searchProc.running = true
   }
 
@@ -181,7 +195,7 @@ Item {
       return
     }
     root.dismiss()
-    Quickshell.execDetached([root.helper, revealFolder ? "--reveal" : "--open", String(entry.path)])
+    Quickshell.execDetached(root.backendCommand(revealFolder ? "--reveal" : "--open", String(entry.path)))
   }
 
   // Rows slide under the pointer as results arrive and as the list scrolls.

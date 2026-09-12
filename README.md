@@ -42,11 +42,19 @@ All local. Ferret does not phone home.
 
 | Need | Used for |
 |---|---|
-| `python3` | `ferret-search` |
+| `/usr/bin/python3` | `ferret-search` |
 | `plocate` | indexed whole-disk search |
 | `fd` | live walk of `$HOME` (falls back to `fdfind`) |
-| `xdg-mime`, `xdg-open` | open a file in its default app |
-| `uwsm-app` | preferred launcher on Omarchy; skipped if missing |
+| PyGObject (GIO) | default-app resolution |
+| `uwsm-app` | scoped launch on Omarchy; skipped if missing |
+| `xdg-open` | fallback opener if GIO/`uwsm-app` cannot launch |
+
+Helpers are resolved from `/usr/bin`, `/bin`, and `/usr/local/bin` by
+absolute path. Ambient `PATH` is never used to pick a binary. Search
+subprocesses have a 1 MiB stdout cap and are killed as a process group on
+cancel or deadline. Files open through GIO's default application (a
+validated `.desktop` file path) rather than by executing a desktop ID as a
+command.
 
 `plocate` is only as fresh as the last `plocate-updatedb.timer` run. `fd`
 covers files created since then, under `$HOME`.
@@ -96,7 +104,7 @@ ferret-search    the backend: search, rank, and open. Usable on its own
 The backend runs standalone, which is the quickest way to check ranking:
 
 ```bash
-./ferret-search "budget xlsx" | jq -r '.[] | "\(.score)  \(.path)"'
+./ferret-search -- "budget xlsx" | jq -r '.[] | "\(.score)  \(.path)"'
 ./ferret-search --open  /path/to/file      # launch in its default app
 ./ferret-search --reveal /path/to/file     # open its folder
 ```

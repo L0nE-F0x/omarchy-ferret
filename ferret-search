@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Ferret's search backend: whole-disk file lookup, ranked for humans.
 
 Two sources feed one ranked list:
@@ -11,17 +11,26 @@ Two sources feed one ranked list:
 Merged, deduped, and scored so the thing you meant is first. Called per
 keystroke by the Ferret overlay; also usable on its own:
 
-    ferret-search "budget xlsx"        # JSON results on stdout
+    ferret-search -- "budget xlsx"     # JSON results on stdout
     ferret-search --open <path>        # hand the path to its default app
     ferret-search --reveal <path>      # open the containing folder
+
+Helpers are resolved from trusted directories by absolute path and executed
+as that same path. Ambient PATH is never consulted. Search children live in
+their own process groups, have a hard stdout cap, and are killed on cancel
+or deadline.
 """
 
+import fcntl
 import json
 import os
 import re
-import shutil
+import select
+import signal
+import stat
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,6 +45,16 @@ RESULT_LIMIT = 60
 # Only the top slice gets stat()ed for recency scoring -- stat is the one
 # genuinely expensive call in here.
 STAT_LIMIT = 240
+
+# Producer-side byte caps. A result-count cap does not bound pathname length.
+STDOUT_CAP = 1 * 1024 * 1024
+JSON_CAP = 1 * 1024 * 1024
+SOURCE_TIMEOUT = 4.0
+SEARCH_DEADLINE = 10
+
+# Directories searched for helper binaries. Lookups never use ambient PATH.
+TRUSTED_BIN_DIRS = ("/usr/bin", "/bin", "/usr/local/bin")
+TRUSTED_PATH = "/usr/bin:/bin"
 
 # Directories that are technically matches but almost never what a person
 # typing into a launcher wants. Penalised, not excluded: search "node_modules"
@@ -94,9 +113,171 @@ PRIME = (
     "/Videos/", "/Music/", "/Projects/",
 )
 
+_LIVE = []
+_LIVE_LOCK = threading.Lock()
+BIN = {}
 
-def run(cmd, timeout=4.0):
-    """Run a command, return its stdout as normalised paths.
+
+def resolve_bin(name):
+    """Return a trusted absolute path for name, or None.
+
+    The returned path is the identity that must be executed: a file inside
+    TRUSTED_BIN_DIRS. Symlinks that escape those directories are rejected.
+    Names containing a slash are rejected so this cannot be used as a path
+    probe.
+    """
+    if not name or name in (".", "..") or "/" in name:
+        return None
+    for directory in TRUSTED_BIN_DIRS:
+        candidate = os.path.join(directory, name)
+        if not os.path.isfile(candidate):
+            continue
+        if not os.access(candidate, os.X_OK):
+            continue
+        try:
+            real = os.path.realpath(candidate)
+        except OSError:
+            continue
+        if not _is_trusted_path(real):
+            continue
+        return candidate
+    return None
+
+
+def _is_trusted_path(path):
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return False
+    for directory in TRUSTED_BIN_DIRS:
+        try:
+            root = os.path.realpath(directory)
+        except OSError:
+            continue
+        if real == root or real.startswith(root + os.sep):
+            return True
+    return False
+
+
+def _resolve_bins():
+    found = {}
+    for name in ("plocate", "fd", "fdfind", "xdg-open", "uwsm-app", "gio"):
+        path = resolve_bin(name)
+        if path:
+            found[name] = path
+    if "fd" not in found and "fdfind" in found:
+        found["fd"] = found["fdfind"]
+    return found
+
+
+def _child_env():
+    env = os.environ.copy()
+    env["PATH"] = TRUSTED_PATH
+    return env
+
+
+def _register(proc):
+    with _LIVE_LOCK:
+        _LIVE.append(proc)
+
+
+def _unregister(proc):
+    with _LIVE_LOCK:
+        try:
+            _LIVE.remove(proc)
+        except ValueError:
+            pass
+
+
+def _kill_group(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _kill_all():
+    with _LIVE_LOCK:
+        procs = list(_LIVE)
+    for proc in procs:
+        _kill_group(proc)
+
+
+def _handle_signal(signum, _frame):
+    signal.signal(signum, signal.SIG_IGN)
+    _kill_all()
+    if signum == signal.SIGALRM:
+        try:
+            sys.stdout.buffer.write(b"[]")
+            sys.stdout.buffer.flush()
+        except Exception:
+            pass
+        os._exit(0)
+    os._exit(128 + (signum if isinstance(signum, int) else 1))
+
+
+def _collect_stdout(proc, cap, timeout):
+    """Read stdout up to cap bytes. Kill the process group on cap or timeout."""
+    deadline = time.monotonic() + timeout
+    buf = bytearray()
+    fd = proc.stdout.fileno()
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    timed_out = False
+    truncated = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            if len(buf) >= cap:
+                truncated = True
+                break
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                timed_out = True
+                break
+            try:
+                chunk = os.read(fd, min(65536, cap - len(buf)))
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            buf.extend(chunk)
+    finally:
+        if timed_out or truncated:
+            _kill_group(proc)
+        try:
+            proc.wait(timeout=0.4)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            try:
+                proc.wait(timeout=0.4)
+            except subprocess.TimeoutExpired:
+                pass
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    if timed_out and not buf:
+        return b""
+    if truncated:
+        # Drop a trailing partial line so we never emit a cut pathname.
+        nl = buf.rfind(b"\n")
+        if nl >= 0:
+            return bytes(buf[: nl + 1])
+        return b""
+    return bytes(buf)
+
+
+def run(cmd, timeout=SOURCE_TIMEOUT):
+    """Run an already-resolved absolute command, return its stdout as paths.
 
     Never raises -- a dead source just means the other one carries the search.
     Trailing slashes are stripped because fd marks directories with one and
@@ -104,15 +285,29 @@ def run(cmd, timeout=4.0):
     strings, survives deduplication twice, and the slashed copy renders with
     an empty basename.
     """
+    if not cmd or not os.path.isabs(cmd[0]):
+        return []
     try:
-        out = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            errors="replace",
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=_child_env(),
         )
-    except (subprocess.SubprocessError, OSError):
+    except OSError:
+        return []
+    _register(proc)
+    try:
+        raw = _collect_stdout(proc, STDOUT_CAP, timeout)
+    finally:
+        _unregister(proc)
+    if not raw:
         return []
     paths = []
-    for line in out.stdout.splitlines():
+    for line in raw.decode("utf-8", errors="replace").splitlines():
         line = line.rstrip("/")
         if line:
             paths.append(line)
@@ -121,9 +316,10 @@ def run(cmd, timeout=4.0):
 
 def locate_source(tokens):
     """plocate with every token ANDed -- its native multi-pattern behaviour."""
-    if not shutil.which("plocate"):
+    plocate = BIN.get("plocate")
+    if not plocate:
         return []
-    return run(["plocate", "-i", "--limit", str(SOURCE_LIMIT)] + tokens)
+    return run([plocate, "-i", "--limit", str(SOURCE_LIMIT), "--"] + list(tokens))
 
 
 def locate_fuzzy(tokens):
@@ -131,27 +327,28 @@ def locate_fuzzy(tokens):
 
     Only worth spending the ~40ms when the literal search came up thin.
     """
-    if not shutil.which("plocate"):
+    plocate = BIN.get("plocate")
+    if not plocate:
         return []
     longest = max(tokens, key=len)
     if len(longest) < 3:
         return []
     pattern = ".*".join(re.escape(ch) for ch in longest)
-    return run(["plocate", "-i", "--regexp", "--limit", str(SOURCE_LIMIT), pattern])
+    return run([plocate, "-i", "--regexp", "--limit", str(SOURCE_LIMIT), "--", pattern])
 
 
 def fd_source(tokens):
     """Live walk of $HOME so today's files are findable before tonight's
     updatedb. fd takes one pattern, so filter on the longest token and let
     the scorer handle the rest."""
-    fd = shutil.which("fd") or shutil.which("fdfind")
+    fd = BIN.get("fd")
     if not fd:
         return []
     longest = max(tokens, key=len)
     return run([
         fd, "--hidden", "--absolute-path", "--color", "never",
         "--max-results", str(SOURCE_LIMIT),
-        "--ignore-case", "--fixed-strings", longest, HOME,
+        "--ignore-case", "--fixed-strings", "--", longest, HOME,
     ])
 
 
@@ -284,100 +481,147 @@ def search(query):
     return results
 
 
-def file_mime(path):
-    """The canonical mime type of a file, e.g. video/x-matroska."""
+def _valid_desktop(path):
+    if not path or not os.path.isabs(path) or not path.endswith(".desktop"):
+        return False
     try:
-        return subprocess.run(
-            ["xdg-mime", "query", "filetype", path],
-            capture_output=True, text=True, timeout=3,
-        ).stdout.strip()
-    except (subprocess.SubprocessError, OSError):
-        return ""
+        st = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    return os.access(path, os.R_OK)
 
 
-def desktop_handler(path):
-    """The .desktop id the system would use for this file.
-
-    Resolved through GIO rather than `xdg-mime query default`, because the
-    two disagree. A mime type can have aliases -- video/x-matroska is also
-    registered as video/matroska -- and mimeapps.list may set the default
-    under either spelling. GIO resolves the alias graph; the xdg-mime shell
-    script does a literal key match, misses a default written under the
-    alias, and falls through to the system-wide default instead. That is
-    how an .mkv set to VLC still opened in mpv.
-
-    GIO is what the file managers and portals use, so following it keeps
-    Ferret's Enter in agreement with the rest of the desktop.
-    """
-    mime = file_mime(path)
-    if not mime:
-        return ""
+def _gio_default_app(path):
+    """Return (AppInfo, Gio.File) for path's content type, or (None, None)."""
     try:
         from gi.repository import Gio
-        info = Gio.AppInfo.get_default_for_type(mime, False)
-        if info is not None:
-            return info.get_id() or ""
-    except Exception:
-        pass
-    # PyGObject missing: fall back to the alias-blind lookup.
+    except ImportError:
+        return None, None
+    gfile = Gio.File.new_for_path(path)
     try:
-        return subprocess.run(
-            ["xdg-mime", "query", "default", mime],
-            capture_output=True, text=True, timeout=3,
-        ).stdout.strip()
-    except (subprocess.SubprocessError, OSError):
+        info = gfile.query_info(
+            "standard::content-type", Gio.FileQueryInfoFlags.NONE, None,
+        )
+        mime = info.get_content_type()
+    except Exception:
+        return None, gfile
+    if not mime:
+        return None, gfile
+    try:
+        app = Gio.AppInfo.get_default_for_type(mime, False)
+    except Exception:
+        return None, gfile
+    return app, gfile
+
+
+def _desktop_filename(app):
+    if app is None:
         return ""
+    try:
+        name = app.get_filename()
+    except Exception:
+        return ""
+    return name if _valid_desktop(name) else ""
+
+
+def _spawn_detached(argv):
+    """Start a session-leader child from a trusted absolute argv[0]."""
+    if not argv or not os.path.isabs(argv[0]):
+        return False
+    try:
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=_child_env(),
+        )
+        return True
+    except OSError:
+        return False
 
 
 def launch(path):
     """Open a path in the app that owns it.
 
-    Directories included -- xdg-mime resolves inode/directory to whatever file
-    manager is registered, so this follows the system default rather than
-    hardcoding one.
-
-    Omarchy runs apps under uwsm so each lands in its own systemd scope;
-    launching by Desktop Entry id keeps that true. The fallback chain exists
-    because the shell's PATH is narrower than a login shell's, so a wrapper
-    that resolves here may not resolve there.
+    The default handler is resolved through GIO (alias-aware mime lookup).
+    The desktop file path GIO returns is validated, then handed to uwsm-app
+    as a file path — never as a desktop-id argv[0]. If uwsm-app is missing,
+    GIO's AppInfo.launch is used. xdg-open is the last resort.
     """
     path = os.path.abspath(path)
-    handler = desktop_handler(path)
-    cmd = [handler, path] if handler else ["xdg-open", path]
-
-    for prefix in (["setsid", "uwsm-app", "--"], ["setsid"], []):
-        try:
-            subprocess.Popen(
-                prefix + cmd,
-                start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return 0
-        except OSError:
-            continue
-    # Every wrapper failed; xdg-open directly is the last resort.
-    try:
-        subprocess.Popen(["xdg-open", path], start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return 0
-    except OSError:
+    if not os.path.exists(path):
         return 1
+
+    app, gfile = _gio_default_app(path)
+    desktop = _desktop_filename(app)
+    uwsm = BIN.get("uwsm-app")
+    gio = BIN.get("gio")
+
+    if desktop and uwsm:
+        if _spawn_detached([uwsm, "--", desktop, path]):
+            return 0
+    if desktop and gio:
+        if _spawn_detached([gio, "launch", desktop, path]):
+            return 0
+    if app is not None and gfile is not None:
+        try:
+            if app.launch([gfile], None):
+                return 0
+        except Exception:
+            pass
+
+    xdg = BIN.get("xdg-open")
+    if xdg and _spawn_detached([xdg, path]):
+        return 0
+    return 1
+
+
+def emit_json(results):
+    while True:
+        payload = json.dumps(
+            results, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload) <= JSON_CAP:
+            sys.stdout.buffer.write(payload)
+            sys.stdout.buffer.flush()
+            return 0
+        if not results:
+            sys.stdout.buffer.write(b"[]")
+            sys.stdout.buffer.flush()
+            return 0
+        results = results[:-1]
 
 
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "--":
+        args = args[1:]
     if not args:
-        print("[]")
+        sys.stdout.buffer.write(b"[]")
         return 0
     if args[0] == "--open":
-        return launch(args[1])
+        return launch(args[1] if len(args) > 1 else "")
     if args[0] == "--reveal":
-        target = args[1]
+        target = args[1] if len(args) > 1 else ""
+        if not target:
+            return 1
         return launch(target if os.path.isdir(target) else os.path.dirname(target))
-    print(json.dumps(search(" ".join(args))))
-    return 0
+
+    signal.signal(signal.SIGALRM, _handle_signal)
+    signal.alarm(int(SEARCH_DEADLINE))
+    return emit_json(search(" ".join(args)))
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGHUP, _handle_signal)
+    BIN.update(_resolve_bins())
     sys.exit(main())
+else:
+    BIN.update(_resolve_bins())

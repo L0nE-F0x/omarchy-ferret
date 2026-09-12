@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+python3 test/backend.test.py
+omarchy plugin validate .
+echo "ok - ferret backend, identity, and manifest"

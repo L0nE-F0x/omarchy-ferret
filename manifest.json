@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "lonefox.ferret",
   "name": "Ferret",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "lonefox",
   "license": "MIT",
   "description": "Type-to-open file search. Hit the hotkey, start typing, press Enter — the file opens in whichever app owns it.",
